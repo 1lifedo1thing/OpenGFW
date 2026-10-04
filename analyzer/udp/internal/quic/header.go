@@ -36,7 +36,10 @@ func parseLongHeader(b *bytes.Reader) (*Header, error) {
 	if err != nil {
 		return nil, err
 	}
-	h := &Header{}
+	if !isLongHeader(typeByte) {
+		return nil, errors.New("not a QUIC long header")
+	}
+	h := &Header{Type: typeByte >> 4 & 0b11}
 	ver, err := beUint32(b)
 	if err != nil {
 		return nil, err
@@ -62,6 +65,13 @@ func parseLongHeader(b *bytes.Reader) (*Header, error) {
 		return nil, err
 	}
 
+	retryPacketType := byte(0b11)
+	if h.Version == V2 {
+		retryPacketType = 0b00
+	}
+	if h.Type == retryPacketType {
+		return nil, errors.New("Retry packet has no length field")
+	}
 	initialPacketType := byte(0b00)
 	if h.Version == V2 {
 		initialPacketType = 0b01

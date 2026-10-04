@@ -1,7 +1,11 @@
 package udp
 
 import (
+	"bytes"
+	"fmt"
+	"os"
 	"reflect"
+	"slices"
 	"testing"
 
 	"github.com/apernet/OpenGFW/analyzer"
@@ -54,5 +58,99 @@ func TestQuicStreamParsing_ClientHello(t *testing.T) {
 	got := u.M.Get("req")
 	if !reflect.DeepEqual(got, want) {
 		t.Errorf("%d B parsed = %v, want %v", len(clientHello), got, want)
+	}
+}
+
+// These first-flight captures come from Hysteria's extras/sniff/testdata.
+func TestQuicStreamFragmentedClientHello(t *testing.T) {
+	read := func(name string, count int) [][]byte {
+		t.Helper()
+		packets := make([][]byte, count)
+		for i := range packets {
+			var err error
+			packets[i], err = os.ReadFile(fmt.Sprintf("testdata/quic-%s-%d.bin", name, i))
+			if err != nil {
+				t.Fatal(err)
+			}
+		}
+		return packets
+	}
+	chrome := read("chrome153", 3)
+	firefox := read("firefox153esr", 2)
+	curl := read("curl8.14-openssl3.5", 2)
+	for _, tt := range []struct {
+		name    string
+		packets [][]byte
+		sni     string
+	}{
+		{"Chrome", chrome[:2], "chrome.sniff.test"},
+		{"Chrome reordered", [][]byte{chrome[1], chrome[0]}, "chrome.sniff.test"},
+		{"Chrome retransmitted", [][]byte{chrome[1], chrome[2]}, "chrome.sniff.test"},
+		{"Chrome duplicates", append(slices.Repeat([][]byte{chrome[0]}, 6), chrome[1]), "chrome.sniff.test"},
+		{"Chrome coalesced", [][]byte{bytes.Join(chrome[:2], nil)}, "chrome.sniff.test"},
+		{"Firefox", firefox, "firefox.sniff.test"},
+		{"Firefox reordered", [][]byte{firefox[1], firefox[0]}, "firefox.sniff.test"},
+		{"curl", curl, "curl.sniff.test"},
+		{"quiche", read("quiche", 3), "quiche.sniff.test"},
+		{"ngtcp2", read("ngtcp2-1.11", 1), "ngtcp2.sniff.test"},
+		{"aioquic", read("aioquic1.2", 1), "aioquic.sniff.test"},
+		{"Other connections", [][]byte{chrome[0], firefox[1], curl[1], chrome[1]}, "chrome.sniff.test"},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			s := (&QUICAnalyzer{}).NewUDP(analyzer.UDPInfo{}, nil)
+			for i, packet := range tt.packets {
+				before := bytes.Clone(packet)
+				u, done := s.Feed(false, packet)
+				if !bytes.Equal(packet, before) {
+					t.Fatal("Feed modified the datagram")
+				}
+				if i < len(tt.packets)-1 {
+					if u != nil || done {
+						t.Fatalf("packet %d: prematurely completed: %v, %v", i, u, done)
+					}
+					// Server traffic must not exhaust the invalid-packet budget.
+					for range quicInvalidCountThreshold {
+						if u, done := s.Feed(true, []byte{0}); u != nil || done {
+							t.Fatal("server traffic terminated reassembly")
+						}
+					}
+					continue
+				}
+				if !done || u == nil || u.Type != analyzer.PropUpdateMerge || u.M.Get("req.sni") != tt.sni {
+					t.Fatalf("got %v, done %v; want SNI %s", u, done, tt.sni)
+				}
+			}
+		})
+	}
+
+	t.Run("Incomplete packet budget", func(t *testing.T) {
+		var s quicStream
+		for i := 1; i <= quicMaxClientPackets; i++ {
+			u, done := s.Feed(false, chrome[0])
+			if u != nil || done != (i == quicMaxClientPackets) || s.invalidCount != 0 {
+				t.Fatalf("packet %d: update %v, done %v, invalid %d", i, u, done, s.invalidCount)
+			}
+		}
+		if len(s.crypto.Stream()) != 0 {
+			t.Fatal("completed analyzer retained fragments")
+		}
+	})
+	t.Run("Close releases fragments", func(t *testing.T) {
+		var s quicStream
+		s.Feed(false, chrome[0])
+		s.Close(false)
+		if !reflect.DeepEqual(s.crypto, (quicStream{}).crypto) {
+			t.Fatal("Close retained reassembly state")
+		}
+	})
+}
+
+func TestQuicStreamInvalidPackets(t *testing.T) {
+	var s quicStream
+	for i := 1; i <= quicInvalidCountThreshold; i++ {
+		u, done := s.Feed(false, []byte("not QUIC"))
+		if u != nil || done != (i == quicInvalidCountThreshold) {
+			t.Fatalf("packet %d: update %v, done %v", i, u, done)
+		}
 	}
 }

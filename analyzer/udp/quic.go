@@ -9,6 +9,7 @@ import (
 
 const (
 	quicInvalidCountThreshold = 4
+	quicMaxClientPackets      = 8
 )
 
 var (
@@ -33,6 +34,8 @@ func (a *QUICAnalyzer) NewUDP(info analyzer.UDPInfo, logger analyzer.Logger) ana
 type quicStream struct {
 	logger       analyzer.Logger
 	invalidCount int
+	packetCount  int
+	crypto       quic.CryptoStream
 }
 
 func (s *quicStream) Feed(rev bool, data []byte) (u *analyzer.PropUpdate, done bool) {
@@ -42,15 +45,27 @@ func (s *quicStream) Feed(rev bool, data []byte) (u *analyzer.PropUpdate, done b
 	const minDataSize = 41
 
 	if rev {
-		// We don't support server direction for now
+		// Server packets can arrive between ClientHello fragments.
+		return nil, false
+	}
+
+	s.packetCount++
+	defer func() {
+		if s.packetCount >= quicMaxClientPackets {
+			done = true
+		}
+		if done {
+			s.crypto = quic.CryptoStream{}
+		}
+	}()
+
+	if err := s.crypto.Feed(data); err != nil {
 		s.invalidCount++
 		return nil, s.invalidCount >= quicInvalidCountThreshold
 	}
-
-	pl, err := quic.ReadCryptoPayload(data)
-	if err != nil || len(pl) < 4 { // FIXME: isn't length checked inside quic.ReadCryptoPayload? Also, what about error handling?
-		s.invalidCount++
-		return nil, s.invalidCount >= quicInvalidCountThreshold
+	pl := s.crypto.Stream()
+	if len(pl) < 4 {
+		return nil, false
 	}
 
 	if pl[0] != internal.TypeClientHello {
@@ -59,12 +74,15 @@ func (s *quicStream) Feed(rev bool, data []byte) (u *analyzer.PropUpdate, done b
 	}
 
 	chLen := int(pl[1])<<16 | int(pl[2])<<8 | int(pl[3])
-	if chLen < minDataSize {
+	if chLen < minDataSize || chLen > quic.MaxCryptoStreamSize-4 {
 		s.invalidCount++
 		return nil, s.invalidCount >= quicInvalidCountThreshold
 	}
 
-	m := internal.ParseTLSClientHelloMsgData(&utils.ByteBuffer{Buf: pl[4:]})
+	if len(pl)-4 < chLen {
+		return nil, false
+	}
+	m := internal.ParseTLSClientHelloMsgData(&utils.ByteBuffer{Buf: pl[4 : 4+chLen]})
 	if m == nil {
 		s.invalidCount++
 		return nil, s.invalidCount >= quicInvalidCountThreshold
@@ -77,5 +95,6 @@ func (s *quicStream) Feed(rev bool, data []byte) (u *analyzer.PropUpdate, done b
 }
 
 func (s *quicStream) Close(limited bool) *analyzer.PropUpdate {
+	s.crypto = quic.CryptoStream{}
 	return nil
 }

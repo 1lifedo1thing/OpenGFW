@@ -13,42 +13,93 @@ import (
 	"golang.org/x/crypto/hkdf"
 )
 
-func ReadCryptoPayload(packet []byte) ([]byte, error) {
-	hdr, offset, err := ParseInitialHeader(packet)
-	if err != nil {
-		return nil, err
-	}
-	// Some sanity checks
-	if hdr.Version != V1 && hdr.Version != V2 {
-		return nil, fmt.Errorf("unsupported version: %x", hdr.Version)
-	}
-	if offset == 0 || hdr.Length == 0 {
-		return nil, errors.New("invalid packet")
-	}
+// MaxCryptoStreamSize bounds the ClientHello and the retained CRYPTO fragments.
+const MaxCryptoStreamSize = 64 * 1024
 
-	initialSecret := hkdf.Extract(crypto.SHA256.New, hdr.DestConnectionID, getSalt(hdr.Version))
-	clientSecret := hkdfExpandLabel(crypto.SHA256.New, initialSecret, "client in", []byte{}, crypto.SHA256.Size())
-	key, err := NewInitialProtectionKey(clientSecret, hdr.Version)
-	if err != nil {
-		return nil, fmt.Errorf("NewInitialProtectionKey: %w", err)
+const maxCryptoFrames = 1024
+
+// CryptoStream collects the client Initial CRYPTO stream across datagrams.
+// Like Hysteria's QUIC sniffer, it accepts shuffled and retransmitted fragments
+// and only exposes the contiguous prefix starting at offset zero.
+// The zero value is ready to use.
+type CryptoStream struct {
+	dcid    []byte
+	version uint32
+	frames  []cryptoFrame
+	size    int
+}
+
+// Feed collects fragments from Initial packets coalesced in a datagram. It does
+// not modify or retain the caller's buffer. A successfully decrypted but incomplete Initial is
+// valid; callers must wait for the complete TLS handshake message themselves.
+func (c *CryptoStream) Feed(data []byte) error {
+	found := false
+	for len(data) > 0 {
+		hdr, offset, err := ParseInitialHeader(data)
+		if err != nil || (hdr.Version != V1 && hdr.Version != V2) ||
+			hdr.Length == 0 || hdr.Length > int64(len(data))-offset {
+			break
+		}
+		packet := data[:offset+hdr.Length]
+		data = data[len(packet):]
+		initialType := uint8(0)
+		if hdr.Version == V2 {
+			initialType = 1
+		}
+		if hdr.Type != initialType || c.dcid != nil &&
+			(c.version != hdr.Version || !bytes.Equal(c.dcid, hdr.DestConnectionID)) {
+			continue
+		}
+
+		initialSecret := hkdf.Extract(crypto.SHA256.New, hdr.DestConnectionID, getSalt(hdr.Version))
+		clientSecret := hkdfExpandLabel(crypto.SHA256.New, initialSecret, "client in", nil, crypto.SHA256.Size())
+		key, err := NewInitialProtectionKey(clientSecret, hdr.Version)
+		if err != nil {
+			continue
+		}
+		// UnProtect decrypts in place. Own the packet so feeding a retransmission
+		// or another analyzer the same datagram does not see mutated bytes.
+		payload, err := NewPacketProtector(key).UnProtect(bytes.Clone(packet), offset, 2)
+		if err != nil {
+			continue
+		}
+		frames, err := extractCryptoFrames(bytes.NewReader(payload))
+		if err != nil {
+			continue
+		}
+		size := 0
+		for _, f := range frames {
+			size += len(f.Data)
+		}
+		if len(c.frames)+len(frames) > maxCryptoFrames || c.size+size > MaxCryptoStreamSize {
+			return errors.New("CRYPTO reassembly limit exceeded")
+		}
+		c.dcid = hdr.DestConnectionID
+		c.version = hdr.Version
+		c.frames = append(c.frames, frames...)
+		c.size += size
+		found = true
 	}
-	pp := NewPacketProtector(key)
-	// https://datatracker.ietf.org/doc/html/draft-ietf-quic-tls-32#name-client-initial
-	//
-	// "The unprotected header includes the connection ID and a 4-byte packet number encoding for a packet number of 2"
-	if int64(len(packet)) < offset+hdr.Length {
-		return nil, fmt.Errorf("packet is too short: %d < %d", len(packet), offset+hdr.Length)
+	if !found {
+		return errors.New("no valid client Initial packet")
 	}
-	unProtectedPayload, err := pp.UnProtect(packet[:offset+hdr.Length], offset, 2)
-	if err != nil {
+	return nil
+}
+
+// Stream returns an owned copy of the contiguous start of the CRYPTO stream.
+func (c *CryptoStream) Stream() []byte {
+	return assembleCryptoFrames(c.frames)
+}
+
+// ReadCryptoPayload reads the contiguous CRYPTO prefix from a single datagram.
+// Use CryptoStream when the ClientHello may span multiple datagrams.
+func ReadCryptoPayload(packet []byte) ([]byte, error) {
+	var c CryptoStream
+	if err := c.Feed(packet); err != nil {
 		return nil, err
 	}
-	frs, err := extractCryptoFrames(bytes.NewReader(unProtectedPayload))
-	if err != nil {
-		return nil, err
-	}
-	data := assembleCryptoFrames(frs)
-	if data == nil {
+	data := c.Stream()
+	if len(data) == 0 {
 		return nil, errors.New("unable to assemble crypto frames")
 	}
 	return data, nil
@@ -88,7 +139,13 @@ func extractCryptoFrames(r *bytes.Reader) ([]cryptoFrame, error) {
 		if err != nil {
 			return nil, err
 		}
-		frame.Data = make([]byte, dataLen)
+		if dataLen > uint64(r.Len()) {
+			return nil, io.ErrUnexpectedEOF
+		}
+		if offset > MaxCryptoStreamSize || dataLen > MaxCryptoStreamSize-offset || len(frames) >= maxCryptoFrames {
+			return nil, errors.New("CRYPTO frame limit exceeded")
+		}
+		frame.Data = make([]byte, int(dataLen))
 		if _, err := io.ReadFull(r, frame.Data); err != nil {
 			return nil, err
 		}
@@ -97,27 +154,19 @@ func extractCryptoFrames(r *bytes.Reader) ([]cryptoFrame, error) {
 	return frames, nil
 }
 
-// assembleCryptoFrames assembles multiple crypto frames into a single slice (if possible).
-// It returns an error if the frames cannot be assembled. This can happen if the frames are not contiguous.
+// assembleCryptoFrames returns the contiguous prefix, ignoring duplicate bytes
+// in overlapping retransmissions and stopping at the first gap.
 func assembleCryptoFrames(frames []cryptoFrame) []byte {
-	if len(frames) == 0 {
-		return nil
-	}
-	if len(frames) == 1 {
-		return frames[0].Data
-	}
-	// sort the frames by offset
-	slices.SortFunc(frames, func(a, b cryptoFrame) int { return cmp.Compare(a.Offset, b.Offset) })
-	// check if the frames are contiguous
-	for i := 1; i < len(frames); i++ {
-		if frames[i].Offset != frames[i-1].Offset+int64(len(frames[i-1].Data)) {
-			return nil
-		}
-	}
-	// concatenate the frames
-	data := make([]byte, frames[len(frames)-1].Offset+int64(len(frames[len(frames)-1].Data)))
+	slices.SortStableFunc(frames, func(a, b cryptoFrame) int { return cmp.Compare(a.Offset, b.Offset) })
+	var data []byte
 	for _, frame := range frames {
-		copy(data[frame.Offset:], frame.Data)
+		n := int64(len(data))
+		if frame.Offset > n {
+			break
+		}
+		if end := frame.Offset + int64(len(frame.Data)); end > n {
+			data = append(data, frame.Data[n-frame.Offset:]...)
+		}
 	}
 	return data
 }
