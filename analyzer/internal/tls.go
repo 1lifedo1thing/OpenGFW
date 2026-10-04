@@ -21,6 +21,7 @@ const (
 	extServerName           = 0x0000
 	extALPN                 = 0x0010
 	extSupportedVersions    = 0x002b
+	extEncryptedServerName  = 0xffce
 	extEncryptedClientHello = 0xfe0d
 )
 
@@ -216,6 +217,8 @@ func parseTLSExtensions(extType uint16, extDataBuf *utils.ByteBuffer, m analyzer
 			}
 			m["supported_versions"] = versions
 		}
+	case extEncryptedServerName:
+		m["esni"] = true
 	case extEncryptedClientHello:
 		// We can't parse ECH for now, just set a flag
 		m["ech"] = true
