@@ -70,7 +70,7 @@ func parseLongHeader(b *bytes.Reader) (*Header, error) {
 		retryPacketType = 0b00
 	}
 	if h.Type == retryPacketType {
-		return nil, errors.New("Retry packet has no length field")
+		return nil, errors.New("retry packet has no length field")
 	}
 	initialPacketType := byte(0b00)
 	if h.Version == V2 {
